@@ -1,6 +1,6 @@
 import AWS from 'aws-sdk';
 import { APIGatewayEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { QuestionUserResponse } from '../models/QuestionUserResponse';
+import fetch from 'node-fetch';
 
 export class Connection {
 	client?: AWS.DynamoDB.DocumentClient;
@@ -413,25 +413,71 @@ export class Connection {
 	 * returns
 	 * - list of connection id's as an array of strings
 	 *****************************************************/
-	async submitResponse(
+	async sumbitResponse(
 		courseId: string,
 		questionId: string,
 		questionOptionId: string,
 		userId: string,
 		sessionId: string
 	): Promise<APIGatewayProxyResult> {
-		try {
-			// attempt to create response in db
-			const result = await QuestionUserResponse.create({
-				questionId: parseInt(questionId),
-				userId: parseInt(userId),
-				sessionId: parseInt(sessionId),
-				questionOptionId: parseInt(questionOptionId),
-			});
+		const params = {
+			questionId: questionId,
+			questionOptionId: questionOptionId,
+			userId: userId,
+			sessionId: sessionId,
+		};
 
-			console.log(result);
-			// if successful, tell the professor a NEW response was recorded
-			await this.sendToProfessor(courseId, 'studentSubmitted');
+		const endpoint =
+			process.env.NODE_ENV == 'development' ? 'http://localhost:3000' : '';
+
+		try {
+			// POST student response to DB
+			const postResponse = await fetch(
+				`${endpoint}/dev/api/v1/question_user_response`,
+				{
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+					},
+					body: JSON.stringify(params),
+				}
+			);
+
+			// convert post response to json
+			const postJson = await postResponse.json();
+
+			// successfully inserted new response
+			if (!postJson.error) {
+				//publish to professor that a student submitted a NEW response
+				await this.sendToProfessor(courseId, 'studentSubmitted');
+			} else {
+				// if we get a uniqueconstraint error, it's because
+				// the user is trying to change their response to the same question
+				if (postJson.error.name == 'SequelizeUniqueConstraintError') {
+					// so instead we do an UPDATE request
+					const updateResponse = await fetch(
+						`${endpoint}/dev/api/v1/question_user_response`,
+						{
+							method: 'PUT',
+							headers: {
+								'content-type': 'application/json',
+							},
+							body: JSON.stringify(params),
+						}
+					);
+
+					// convert the update response to json, make sure it worked
+					const updateJson = await updateResponse.json();
+					if (updateJson.error) {
+						// console.log(updateJson);
+						throw updateJson.error;
+					}
+					// if there is somehow a different post error
+					// besides uniqueconstraint
+				} else {
+					throw postJson.error;
+				}
+			}
 
 			return {
 				statusCode: 200,
@@ -440,51 +486,11 @@ export class Connection {
 				}),
 			};
 		} catch (error) {
-			// if this student already submitted for this question,
-			// i.e. record already exists in db
-			if (error.name == 'SequelizeUniqueConstraintError') {
-				// then we want to update an existing response,
-				// but not notify the professor
-				console.log('response already exists. updating...');
-				try {
-					await QuestionUserResponse.update(
-						{
-							questionOptionId: parseInt(questionOptionId),
-						},
-						{
-							where: {
-								questionId: questionId,
-								userId: userId,
-								sessionId: sessionId,
-							},
-						}
-					);
-
-					return {
-						statusCode: 200,
-						body: JSON.stringify({
-							message: 'successfully updated student response',
-						}),
-					};
-				} catch (error) {
-					console.log('error updating existing student response:');
-					console.log(error);
-					return {
-						statusCode: 400,
-						body: JSON.stringify({
-							message: 'error updating existing student response',
-						}),
-					};
-				}
-			}
-
-			// different error besides unique constraint
-			console.log('error inserting new student response:');
 			console.log(error);
 			return {
 				statusCode: 400,
 				body: JSON.stringify({
-					message: 'error submitting new student response',
+					message: 'error submitting student response',
 				}),
 			};
 		}
